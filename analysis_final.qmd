@@ -1,5 +1,5 @@
 ---
-title: "LendingClub: Survival Analysis"
+title: "LendingClub P2P loan data: Survival Analysis"
 lang: en
 format:
   html:
