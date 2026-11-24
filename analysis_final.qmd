@@ -1,0 +1,1469 @@
+---
+title: "LendingClub: Survival Analysis"
+lang: en
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+execute:
+  warning: true
+  message: false
+---
+
+## Contents
+
+1.  Research Question & Related Work
+2.  Data Overview & Preprocessing Rule
+3.  K-M Estimator & Log-rank Test
+4.  Nested Cox PH Model Comparison
+5.  Regression diagnostics: Cox–Snell·Martingale·PH graphical check
+6.  Cutpoint Selection
+7.  Piecewise Cox
+8.  Piecewise Cox - regression diagnostics
+9.  Supplementary Analysis: Competing Risks — CIF&Gray Test
+
+## 1. Research Question & Related Work
+
+Using loan and borrower characteristics identified in prior research, we explore **factors other than credit grade that explain delinquency or default risk and examine whether their associations with risk vary over the life of the loan**.
+
+- RQ1: How do Kaplan–Meier curves based on proxy event times differ by credit grade?
+- RQ2: Does each literature-based covariate group (A, B, and C) provide additional explanatory information after accounting for credit grade and origination year?
+- RQ3: (How) do the associations for key factors in each covariate group differ between the early and late periods?
+
+#### Related Work
+
+[Serrano-Cinca et al. (2015), Determinants of Default in P2P Lending](https://doi.org/10.1371/journal.pone.0139427) provides the rationale for examining credit grade, income, loan purpose, credit history, and debt measures. The study found that credit grade (`grade`) was the most important predictor of default and that accounting for borrowers’ debt burden improved prediction.
+
+- We extend prior work by assessing the incremental explanatory value beyond credit grade, adjusting for multiple covariates, examining how their associations with delinquency or default change over time, and accounting for repayment in full as a competing event.
+
+[Li et al. (2023)](https://doi.org/10.1016/j.ejor.2022.08.013) motivates distinguishing loan distress from completed repayment. We use `cmprsk` in the supplementary sections for cumulative incidence and Gray tests.
+
+```{r}
+#| label: setup
+.libPaths(unique(c(normalizePath(".R-library", mustWork = FALSE), .libPaths())))
+required_pkgs <- c("cmprsk", "survival", "data.table", "dplyr", "tidyr", "ggplot2", "scales", "knitr")
+missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs)) stop("Install packages: ", paste(missing_pkgs, collapse = ", "))
+
+library(survival)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+#options(width = 110, pillar.sigfig = 5)
+#invisible(Sys.setlocale("LC_CTYPE", "en_US.UTF-8"))
+
+set.seed(20261118)
+output_dir <- "analysis_outputs/final_selected_cut6"
+figure_dir <- file.path(output_dir, "figures")
+cache_dir <- "analysis_outputs/final_grouped_nested/fit_cache"
+invisible(lapply(c(output_dir, figure_dir, cache_dir), dir.create, recursive = TRUE, showWarnings = FALSE))
+use_fit_cache <- TRUE
+analysis_workers <- 2L  
+reference_split_month <- 12L  # descriptive comparison only
+split_month <- NA_integer_  # assigned by the cutpoint profile before fitting the main piecewise model
+input_hash <- unname(tools::md5sum("pre_loan.csv"))
+```
+
+```{r}
+#| label: shared-helpers
+# set graph theme and shared functions
+project_plot_theme <- function() {
+  theme_minimal(base_size = 13) + theme(
+  plot.title = element_text(face = "bold", size = 19, colour = "#172B3A"),
+  plot.subtitle = element_text(colour = "#52616B", margin = margin(b = 12)),
+  panel.grid.minor = element_blank(), panel.grid.major.x = element_blank(),
+  plot.caption = element_text(hjust = 0, colour = "#52616B", size = 10),
+  legend.position = "bottom", legend.title = element_blank(),
+  plot.margin = margin(18, 24, 18, 18))
+}
+
+theme_set(project_plot_theme())
+grade_colours <- c(A = "#91A9B8", B = "#7B98AB", C = "#65879E", D = "#537A98",
+                   E = "#406480", F = "#2C4C65", G = "#172F43")
+
+save_table <- function(x, name) {
+    write.csv(x, file.path(output_dir, paste0(name, ".csv")), 
+              row.names = FALSE)
+    }
+
+save_figure <- function(p, name, width = 12, height = 7) {
+  ggsave(file.path(figure_dir, paste0(name, ".png")), p, width = width, height = height, dpi = 180, bg = "white")
+  ggsave(file.path(figure_dir, paste0(name, ".pdf")), p, width = width, height = height, bg = "white")
+}
+    
+hr_table <- function(model) {
+  z <- summary(model)
+  data.frame(term = rownames(z$coefficients), beta = z$coefficients[, "coef"],
+    se = z$coefficients[, "se(coef)"], HR = z$conf.int[, "exp(coef)"],
+    lower = z$conf.int[, "lower .95"], upper = z$conf.int[, "upper .95"],
+    p_value = z$coefficients[, "Pr(>|z|)"], row.names = NULL)
+}
+
+ph_table <- function(model, label) {
+  cox.zph(model)$table %>% as.data.frame() %>%
+    { data.frame(term = rownames(.), ., row.names = NULL) } %>%
+    mutate(model = label, .before = 1) %>% rename(p_value = p)
+}
+    
+# Record convergence problems instead of silently interpreting unstable fits.
+checked_coxph <- function(formula, data, label, ...) {
+  notes <- character()
+  fit <- withCallingHandlers(
+    coxph(formula, data = data, model = TRUE, ...),
+    warning = function(w) {
+      notes <<- c(notes, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    })
+  attr(fit, "analysis_warnings") <- unique(notes)
+  fit
+}
+fit_status <- function(model, label) {
+  notes <- attr(model, "analysis_warnings")
+  bad_warning <- any(grepl("infinite|did not converge|converged before", notes, ignore.case = TRUE))
+  data.frame(model = label, n = model$n, events = model$nevent,
+    parameters = length(coef(model)), fit_ok = all(is.finite(coef(model))) && !bad_warning,
+    warning = paste(notes, collapse = " | "))
+}
+
+# PSOCK creates independent R sessions; no fork is used.
+start_analysis_cluster <- function(workers, exports, envir = parent.frame()) {
+  cluster <- parallel::makePSOCKcluster(as.integer(workers), rscript_args = "--vanilla")
+  success <- FALSE
+  on.exit(if (!success) parallel::stopCluster(cluster), add = TRUE)
+  parallel::clusterCall(cluster, function(paths) { .libPaths(paths); NULL }, .libPaths())
+  parallel::clusterCall(cluster, base::options, options("contrasts", "na.action"))
+  parallel::clusterEvalQ(cluster, {
+    suppressPackageStartupMessages(library(survival))
+    suppressPackageStartupMessages(library(dplyr))
+    NULL
+  })
+  parallel::clusterCall(cluster, base::setwd, getwd())
+  export_env <- new.env(parent = emptyenv())
+  for (name in exports) {
+    value <- get(name, envir = envir, inherits = TRUE)
+    # Avoid serializing the entire Positron/knitr session with helper closures.
+    if (is.function(value)) environment(value) <- globalenv()
+    assign(name, value, envir = export_env)
+  }
+  parallel::clusterExport(cluster, exports, envir = export_env)
+  success <- TRUE
+  cluster
+}
+
+model_formula <- function(variables, structure = c("initial", "piecewise")) {
+  structure <- match.arg(structure)
+  response <- if (structure == "initial") "Surv(duration_months, event)" else "Surv(tstart, tstop, event_piece)"
+  fixed <- if (structure == "initial") c("grade", "strata(issue_year)") else "strata(year_grade)"
+  as.formula(paste(response, "~", paste(c(fixed, variables), collapse = " + ")), env = globalenv())
+}
+```
+
+## 2. Data Definition and Preprocessing Checks
+
+The unit of analysis is an individual approved and originated personal loan. Loans were originated from June 2007 through December 2015, and follow-up ended in January 2016.
+
+- The event (`event=1`) includes both Late categories, Default, and Charged Off. The last payment month serves as a proxy for the event month.
+- Loans classified as Current or In Grace Period are censored in January 2016. Fully Paid loans are censored in their last payment month.
+- For `event_type`, 0 indicates the end of follow-up, 1 indicates the event, and 2 indicates repayment in full. The regression models use `event`.
+- The data do not capture prior delinquencies that were subsequently resolved or the exact month of first delinquency.
+- Repayment in full precludes subsequent delinquency or default on the loan, so the actual cumulative event probability requires accounting for this competing event. The Kaplan–Meier quantity 1−S treats repayment in full as censoring.
+
+```{r}
+#| label: data-load
+dat <- data.table::fread("pre_loan.csv", encoding = "UTF-8", data.table = FALSE) %>%
+  mutate(row_id = row_number(), 
+         grade = factor(grade, levels = LETTERS[1:7]),
+         across(all_of(c("term_months", "purpose", "home_ownership",
+                         "emp_length", "issue_year")), factor),
+         dti10 = dti / 10, util10 = revol_util / 10,
+         delinq_any = as.integer(delinq_2yrs > 0), 
+         pubrec_any = as.integer(pub_rec > 0),
+         log_revol_bal = log1p(revol_bal), open_acc10 = open_acc / 10,
+         total_acc10 = total_acc / 10,
+         year_grade = interaction(issue_year, grade, sep = ":", drop = TRUE))
+
+#month_number <- function(x) as.integer(substr(x, 1, 4)) * 12L + as.integer(substr(x, 6, 7))
+```
+
+```{r}
+# data summary 
+status_summary <- dat %>% count(loan_status, name = "n") %>% 
+mutate(percent = 100 * n / sum(n))
+status_summary
+
+continuous <- c("duration_months", "loan_amnt", "annual_inc", "dti", "revol_util", "int_rate")
+
+continuous_summary <- dat %>% summarise(across(all_of(continuous), list(
+  missing = ~sum(is.na(.x)), min = ~min(.x), median = ~median(.x),
+  p99 = ~unname(quantile(.x, .99)), max = ~max(.x)), .names = "{.col}__{.fn}")) %>%
+  pivot_longer(everything(), names_to = c("variable", ".value"), names_sep = "__") %>% as.data.frame()
+
+continuous_summary
+```
+
+### Data Overview
+
+```{r}
+#| label: data-figures
+viz <- dat %>%
+  mutate(
+    issue_year = as.integer(as.character(issue_year)),
+    grade = factor(grade, levels = LETTERS[1:7]),
+    endpoint = factor(event_type, levels = c(0, 2, 1),
+      labels = c("Current / In Grace Period", "Fully Paid", "Late / Default / Charged Off"))
+  )
+
+cols <- c("Current / In Grace Period" = "#537A98", "Fully Paid" = "#57A698", "Late / Default / Charged Off" = "#CF7653")
+cohort <- viz %>% count(issue_year, endpoint, name = "n")
+totals <- viz %>% count(issue_year, name = "n")
+
+p_cohort <- ggplot(cohort, aes(factor(issue_year), n, fill = endpoint)) +
+  geom_col(width = .72) + scale_fill_manual(values = cols, drop = FALSE) +
+  geom_text(data = totals, aes(factor(issue_year), n, label = scales::comma(n)), inherit.aes = FALSE, vjust = -.55, size = 3.6) +
+scale_y_continuous(labels = scales::label_number(scale = .001, suffix = "k"), expand = expansion(mult = c(0, .14))) +
+labs(title = "A. Recent loans dominate the sample", 
+     subtitle = sprintf("N = %s | %.1f%% originated in 2014-2015",
+                        scales::comma(nrow(viz)), 100 * mean(viz$issue_year >= 2014)), 
+     x = "issue_year", y = "Number of loans", caption = "Colors show observed endpoint categories, not time-adjusted event probabilities.\nFully Paid and Current / In Grace Period are censored in the current survival analysis.")
+
+save_figure(p_cohort, "01_cohort_composition")
+
+month_number <- function(x) as.integer(substr(x, 1, 4)) * 12L + as.integer(substr(x, 6, 7))
+
+viz <- viz %>%
+  mutate(available_months = month_number(observation_cutoff_month) - month_number(issue_month))
+
+followup <- viz %>%
+  group_by(issue_year) %>%
+  summarise(lo = quantile(duration_months, .25), med = median(duration_months),
+            hi = quantile(duration_months, .75), potential = median(available_months),
+            .groups = "drop") %>% as.data.frame()
+
+p_followup <- ggplot(followup, aes(issue_year, med)) +
+  geom_line(aes(y = potential, colour = "Median calendar time to cutoff"), linetype = 2, linewidth = .85) +
+  geom_point(aes(y = potential, colour = "Median calendar time to cutoff"), size = 2.5) +
+  geom_linerange(aes(ymin = lo, ymax = hi, colour = "Observed duration: median and IQR"), linewidth = 3, alpha = .6) +
+  geom_point(aes(colour = "Observed duration: median and IQR"), size = 3) +
+  scale_colour_manual(values = c("Median calendar time to cutoff" = "#A7854E", "Observed duration: median and IQR" = "#537A98")) +
+  scale_x_continuous(breaks = 2007:2015) +
+  labs(title = "B. Loans have unequal observation windows", subtitle = "Later cohorts have less time to reach an observed endpoint | cutoff: January 2016",
+       x = "issue_year", y = "Months", caption = "Observed duration ends at the proxy event month, full repayment, or administrative cutoff.\nIQR = 25th-75th percentiles. Calendar time to cutoff is not the actual observed duration.")
+
+save_figure(p_followup, "02_observation_windows")
+  
+# Exact full-data quartiles.
+variables <- c("dti", "revol_util", "int_rate")
+profile <- lapply(variables, function(variable_name) {
+  viz %>%
+    group_by(grade) %>%
+    summarise(
+      ymin = quantile(.data[[variable_name]], .05, na.rm = TRUE),
+      lower = quantile(.data[[variable_name]], .25, na.rm = TRUE),
+      middle = median(.data[[variable_name]], na.rm = TRUE),
+      upper = quantile(.data[[variable_name]], .75, na.rm = TRUE),
+      ymax = quantile(.data[[variable_name]], .95, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(variable = variable_name)
+}) %>%
+  bind_rows() %>% as.data.frame()
+p_profile <- ggplot(profile, aes(grade, middle)) +
+  geom_boxplot(aes(ymin = ymin, lower = lower, middle = middle, upper = upper, ymax = ymax),
+               stat = "identity", fill = "#D7E5ED", colour = "#355C75", width = .55) +
+  facet_wrap(~ variable, scales = "free_y", nrow = 1) +
+  labs(title = "C. How much information does grade summarize?", subtitle = "Compare within-grade variation in debt burden, credit utilization, and interest rates",
+       x = "grade", y = "Value (percentage points)", caption = "Box: 25th-75th percentiles; center: median; whiskers: 5th-95th percentiles.\nSummaries use all loans; tail values remain in the dataset. These are descriptive distributions, not adjusted effects.")
+save_figure(p_profile, "03_grade_profiles", height = 6.5)
+
+endpoint_counts <- viz %>%
+  count(endpoint, name = "n") %>%
+  mutate(percent = 100 * n / sum(n))
+
+save_table(cohort, "cohort_counts")
+save_table(followup, "observation_windows")
+save_table(profile, "grade_profile_quantiles")
+p_cohort
+p_followup
+p_profile
+```
+
+## 3. K-M estimator and log-rank test (RQ1)
+
+- The 12-, 24-, and 36-month time points were chosen for summarization and visualization.
+
+```{r}
+#| label: km-curves
+km <- survfit(Surv(duration_months, event) ~ grade, data = dat)
+km_curve_summary <- summary(km, censored = TRUE)
+km_curve <- data.frame(
+  grade = sub("^grade=", "", as.character(km_curve_summary$strata)),
+  month = km_curve_summary$time,
+  KM_survival = km_curve_summary$surv
+) %>%
+  bind_rows(data.frame(grade = levels(dat$grade), month = 0, KM_survival = 1)) %>%
+  arrange(grade, month)
+
+# visualization
+grade_colours <- c(A = "#91A9B8", B = "#7B98AB", C = "#65879E",
+                   D = "#537A98", E = "#406480", F = "#2C4C65", G = "#172F43")
+km_end_labels <- km_curve %>%
+  filter(month <= 36) %>%
+  group_by(grade) %>%
+  slice_max(month, n = 1, with_ties = FALSE) %>%
+  ungroup() %>% as.data.frame()
+km_plot <- km_curve %>%
+  filter(month <= 36) %>%
+  ggplot(aes(x = month, y = KM_survival, colour = grade)) +
+  geom_step(linewidth = .9) +
+  geom_text(data = km_end_labels, aes(x = 36.7, label = grade),
+            hjust = 0, size = 4, fontface = "bold", show.legend = FALSE) +
+  scale_colour_manual(values = grade_colours) +
+  scale_x_continuous(breaks = seq(0, 36, 6)) +
+  scale_y_continuous(labels = scales::label_percent(accuracy = 1)) +
+  coord_cartesian(xlim = c(0, 38), ylim = c(.5, 1), expand = FALSE) +
+  labs(title = "KM survival by credit grade",
+       subtitle = "Approved individual loans | grades A-G | first 36 months",
+       x = "Months since origination", y = "KM survival",
+       caption = "Fully Paid loans are censored at the last payment month.
+Event times use last-payment proxies; 1 - KM survival is not the actual cumulative event probability.") +
+  project_plot_theme() +
+  theme(legend.position = "none")
+  
+km_plot
+save_figure(km_plot, "04_km_by_grade")
+```
+
+```{r}
+#| label: km-tables
+# k-m summary
+ks <- summary(km, times = c(12, 24, 36))
+km_summary <- data.frame(grade = sub("^grade=", "", as.character(ks$strata)), month = ks$time,
+  at_risk = ks$n.risk, KM_survival = ks$surv, lower = ks$lower, upper = ks$upper) %>% arrange(grade, month)
+km_summary %>% print(row.names = FALSE)
+
+# log-rank summary
+logrank <- survdiff(Surv(duration_months, event) ~ grade, data = dat)
+logrank_summary <- data.frame(chisq = unname(logrank$chisq), df = length(logrank$n) - 1L) %>%
+  mutate(p_value = pchisq(chisq, df, lower.tail = FALSE))
+logrank_summary
+save_table(km_summary, "km_summary")
+save_table(logrank_summary, "logrank_summary")
+```
+
+## 4. Nested Model Comparisons by Covariate Group (RQ2)
+
+- We also tried AIC-based stepwise selection. It retained most covariates and therefore offered little simplification. Nested model comparisons by covariate group directly address whether each literature-based group adds explanatory value after accounting for credit grade and origination year.
+
+- **A — Financial Characteristics and Debt Burden:** `annual_inc`, `dti`, `revol_util`, `revol_bal`
+
+- **B — Loan Contract Characteristics:** `term_months`, `loan_amnt`, `int_rate`, `purpose`
+
+- **C — Credit History and Borrower Background:** `delinq_2yrs`, `pub_rec`, `inq_last_6mths`, `open_acc`, `total_acc`, `home_ownership`, `emp_length`
+
+The baseline model `M0` includes `grade` as a covariate and stratifies by `issue_year`.
+
+$$M_0:\quad h(t\mid G,Y)=h_{0,Y}(t)\exp\left(\beta_G^{\top}G\right).$$
+
+We used likelihood ratio tests to compare nested models fitted to the same data with the same stratification. The degrees of freedom equal the number of added regression coefficients. We adjusted the p-values using the Holm method.
+
+```{r}
+#| label: grouped-model-definition
+candidate_variables <- c("term_months", "log_loan_amnt", "int_rate", "purpose", "log_annual_inc",
+  "dti10", "util10", "delinq_any", "pubrec_any", "inq_last_6mths", "log_revol_bal",
+  "open_acc10", "total_acc10", "home_ownership", "emp_length")
+
+variable_dictionary <- data.frame(variable = candidate_variables,
+  rationale = c("Loan term", "Loan amount (log scale)", "Annual interest rate", "Loan purpose", "Annual income (log scale)",
+    "DTI (per 10 percentage points)", "Revolving credit utilization (per 10 percentage points)", "Any delinquency in the past 2 years", "Any public record",
+    "Number of inquiries in the past 6 months", "Revolving credit balance (log(1 + x))", "Open accounts (per 10 accounts)",
+    "Total accounts (per 10 accounts)", "Homeownership", "Employment length"))
+
+group_variables <- list(
+  A = c("log_annual_inc", "dti10", "util10", "log_revol_bal"),
+  B = c("term_months", "log_loan_amnt", "int_rate", "purpose"),
+  C = c("delinq_any", "pubrec_any", "inq_last_6mths", "open_acc10", "total_acc10",
+        "home_ownership", "emp_length"))
+stopifnot(setequal(unlist(group_variables), candidate_variables),
+  !anyDuplicated(unlist(group_variables)))
+
+analysis_variables <- candidate_variables
+
+variables_for <- function(groups) candidate_variables[candidate_variables %in% unlist(group_variables[groups])]
+
+model_specs <- list(M0 = character(), MA = variables_for("A"), MB = variables_for("B"),
+  MC = variables_for("C"), MAB = variables_for(c("A", "B")),
+  MAC = variables_for(c("A", "C")), MBC = variables_for(c("B", "C")),
+  MABC = variables_for(c("A", "B", "C")))
+
+group_membership <- bind_rows(lapply(names(group_variables), function(g)
+  data.frame(group = g, variable = group_variables[[g]]))) %>%
+  left_join(variable_dictionary, by = "variable") %>% as.data.frame()
+group_membership
+save_table(group_membership, "group_membership")
+
+analysis_data_hash <- function(dataset) {
+  columns <- intersect(c("grade", "issue_year", "year_grade", candidate_variables,
+    "duration_months", "event", "tstart", "tstop", "event_piece"), names(dataset))
+  path <- tempfile(fileext = ".rds")
+  on.exit(unlink(path), add = TRUE)
+  saveRDS(dataset %>% select(all_of(columns)), path, compress = FALSE)
+  unname(tools::md5sum(path))
+}
+                                     
+group_fit_one <- function(variables, structure, dataset, data_id, model_name) {
+  formula <- model_formula(variables, structure)
+  signature <- paste(input_hash, data_id, model_name, paste(deparse(formula), collapse = " "),
+    as.character(packageVersion("survival")),
+    paste(capture.output(dput(options("contrasts"))), collapse = " "),
+    paste(deparse(body(group_fit_one)), collapse = "\n"), "nested;efron;v1", collapse = "|")
+  tmp <- tempfile(); writeLines(signature, tmp)
+  key <- unname(tools::md5sum(tmp)); unlink(tmp)
+  path <- file.path(cache_dir, paste0("nested_", key, ".rds"))
+  is_full <- model_name == "MABC"
+  if (!is_full && use_fit_cache && file.exists(path)) {
+    return(list(metrics = as.data.frame(readRDS(path)), fit = NULL))
+  }
+  fit <- checked_coxph(formula, dataset, label = model_name, ties = "efron",
+    x = is_full, y = is_full)
+  stopifnot(fit$n == nrow(dataset))
+  status <- fit_status(fit, model_name)
+  metrics <- data.frame(n = fit$n, events = fit$nevent,
+    log_likelihood = as.numeric(logLik(fit)), parameters = attr(logLik(fit), "df"),
+    AIC = AIC(fit), fit_ok = status$fit_ok, warning = status$warning)
+  if (use_fit_cache) saveRDS(metrics, path)
+  list(metrics = metrics, fit = if (is_full) fit else NULL)
+}
+       
+fit_group_set <- function(datasets, structure, label) {
+  ids <- paste(label, seq_along(datasets), vapply(datasets, analysis_data_hash, character(1)), sep = ":")
+  rows <- list(); full_fits <- NULL
+  n_loans <- length(unique(unlist(lapply(datasets, function(d) d$row_id))))
+  for (name in names(model_specs)) {
+    runs <- lapply(seq_along(datasets), function(i)
+      group_fit_one(model_specs[[name]], structure, datasets[[i]], ids[i], name))
+    m <- bind_rows(lapply(runs, function(z) z$metrics))
+    stopifnot(all(m$fit_ok))
+    rows[[name]] <- data.frame(model = name, n_loans = n_loans, n_intervals = sum(m$n),
+      events = sum(m$events), log_likelihood = sum(m$log_likelihood),
+      parameters = sum(m$parameters), AIC = sum(m$AIC), fit_ok = all(m$fit_ok))
+    if (name == "MABC") full_fits <- lapply(runs, function(z) z$fit)
+  }
+  metrics <- bind_rows(rows) %>% as.data.frame()
+  stopifnot(length(unique(metrics$n_intervals)) == 1L, length(unique(metrics$events)) == 1L)
+  list(metrics = metrics, full_fits = full_fits)
+}
+                                        
+nested_lr_table <- function(metrics) {
+  pairs <- data.frame(
+    family = c(rep("baseline_addition", 3), rep("conditional_contribution", 3), rep("sequential", 3), "all_groups"),
+    group = c("A", "B", "C", "A", "B", "C", "A", "B", "C", "A+B+C"),
+    null_model = c("M0", "M0", "M0", "MBC", "MAC", "MAB", "M0", "MA", "MAB", "M0"),
+    alternative_model = c("MA", "MB", "MC", "MABC", "MABC", "MABC", "MA", "MAB", "MABC", "MABC"))
+  stopifnot(all(vapply(seq_len(nrow(pairs)), function(i)
+    all(model_specs[[pairs$null_model[i]]] %in% model_specs[[pairs$alternative_model[i]]]), logical(1))))
+  null <- metrics[match(pairs$null_model, metrics$model), ]
+  alt <- metrics[match(pairs$alternative_model, metrics$model), ]
+  stopifnot(all(null$n_intervals == alt$n_intervals), all(null$events == alt$events),
+    all(alt$log_likelihood - null$log_likelihood >= -1e-5), all(alt$parameters > null$parameters))
+  pairs %>% mutate(LR = pmax(0, 2 * (alt$log_likelihood - null$log_likelihood)),
+    df = alt$parameters - null$parameters, p_value = pchisq(LR, df, lower.tail = FALSE),
+    delta_AIC = alt$AIC - null$AIC) %>% group_by(family) %>%
+    mutate(p_holm = p.adjust(p_value, method = "holm")) %>% ungroup() %>%
+    mutate(p_display = format.pval(p_value, digits = 3, eps = .001),
+      p_holm_display = format.pval(p_holm, digits = 3, eps = .001)) %>% as.data.frame()
+}
+                       
+group_slide_table <- function(tests, stage) {
+  b <- tests %>% filter(family == "baseline_addition") %>%
+    select(group, base_LR = LR, base_df = df, baseline_p_Holm = p_holm_display)
+  c <- tests %>% filter(family == "conditional_contribution") %>%
+    select(group, cond_LR = LR, cond_df = df, conditional_p_Holm = p_holm_display)
+  b %>% left_join(c, by = "group") %>% mutate(stage = stage,
+    n_variables = vapply(group, function(g) length(group_variables[[g]]), integer(1)),
+    baseline_LR_df = sprintf("%.2f (%d)", base_LR, as.integer(base_df)),
+    conditional_LR_df = sprintf("%.2f (%d)", cond_LR, as.integer(cond_df))) %>%
+    select(stage, group, n_variables, baseline_LR_df, baseline_p_Holm,
+      conditional_LR_df, conditional_p_Holm) %>% as.data.frame()
+}
+```
+
+```{r}
+#| label: initial-group-comparisons
+initial_nested <- fit_group_set(list(dat), "initial", "initial")
+initial_model_comparison <- initial_nested$metrics
+initial_group_tests <- nested_lr_table(initial_model_comparison)
+initial_model_comparison
+
+initial_group_tests %>% print(row.names = FALSE)
+save_table(initial_model_comparison, "initial_nested_models")
+save_table(initial_group_tests, "initial_group_lr_tests")
+
+initial_group_slide <- group_slide_table(initial_group_tests, "initial")
+initial_group_slide %>% print(row.names = FALSE)
+save_table(initial_group_slide, "initial_group_slide_table")
+```
+
+```{r}
+#| label: initial-full-model
+m_initial <- initial_nested$full_fits[[1]]
+initial_hr <- hr_table(m_initial)
+initial_ph <- ph_table(m_initial, "initial_MABC")
+initial_hr %>% print(row.names = FALSE)
+
+save_table(initial_hr, "initial_full_hr")
+save_table(initial_ph, "initial_ph")
+```
+
+## 5. MABC Regression Diagnostics (RQ2)
+
+### Overall Model Fit with Cox–Snell Residuals
+
+```{r}
+#| label: initial-regression-diagnostics
+initial_martingale <- as.numeric(residuals(m_initial, type = "martingale"))
+initial_cox_snell <- pmax(0, dat$event - initial_martingale)
+initial_cs_fit <- survfit(Surv(initial_cox_snell, dat$event) ~ 1, stype = 2, ctype = 1, se.fit = FALSE)
+initial_cs_keep <- unique(round(seq(1, length(initial_cs_fit$time), length.out = min(2000L, length(initial_cs_fit$time)))))
+initial_cs_data <- data.frame(residual = initial_cs_fit$time[initial_cs_keep],
+  cumulative_hazard = initial_cs_fit$cumhaz[initial_cs_keep])
+initial_cs_plot <- initial_cs_data %>% filter(residual <= quantile(initial_cox_snell, .99)) %>%
+  ggplot(aes(residual, cumulative_hazard)) + geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "#A7854E") +
+  geom_step(colour = "#537A98", linewidth = .8) + coord_equal() +
+  labs(title = "Initial MABC: Cox-Snell diagnostic", x = "Cox-Snell residual", y = "Nelson-Aalen cumulative hazard") +
+  project_plot_theme()
+initial_cs_plot
+save_figure(initial_cs_plot, "initial_cox_snell")
+save_table(initial_cs_data, "initial_cox_snell")
+```
+
+### Functional Form of Continuous Covariates with Martingale Residuals
+
+Following pages 8–10 of the lecture PDF, we plot martingale residuals from initial models that omit either DTI or log income. We use means within quantile groups and LOWESS to assess curvature, taking into account correlations among covariates and the limited range of the residuals.
+
+```{r}
+#| label: initial-martingale-shape
+set.seed(20261118)
+scatter_rows <- sample.int(nrow(dat), min(15000L, nrow(dat)))
+initial_mart_bins <- list(); initial_mart_points <- list()
+for (variable in c("dti10", "log_annual_inc")) {
+  reduced_terms <- setdiff(analysis_variables, variable)
+  reduced_formula <- as.formula(paste("Surv(duration_months, event) ~",
+    paste(c("grade", "strata(issue_year)", reduced_terms), collapse = " + ")))
+  reduced_model <- coxph(reduced_formula, data = dat, ties = "efron")
+  z <- data.frame(value = dat[[variable]], martingale = as.numeric(residuals(reduced_model, type = "martingale")))
+  initial_mart_points[[variable]] <- z %>% slice(scatter_rows) %>% mutate(variable = variable)
+  breaks <- unique(quantile(z$value, probs = seq(0, 1, length.out = 81)))
+  bins <- z %>% mutate(bin = cut(value, breaks, include.lowest = TRUE)) %>% group_by(bin) %>%
+    summarise(value = mean(value), martingale = mean(martingale), n = n(), .groups = "drop") %>% arrange(value) %>% as.data.frame()
+  smoothed <- lowess(bins$value, bins$martingale, f = .35)
+  bins <- bins %>% mutate(smooth = approx(smoothed$x, smoothed$y, xout = value, ties = mean, rule = 2)$y,
+                          variable = variable)
+  initial_mart_bins[[variable]] <- bins
+  rm(reduced_model)
+}
+initial_mart_bins <- bind_rows(initial_mart_bins)
+initial_mart_points <- bind_rows(initial_mart_points)
+initial_mart_limits <- data.frame(variable = c("dti10", "log_annual_inc"),
+  xmax = c(unname(quantile(dat$dti10, .995)), unname(quantile(dat$log_annual_inc, .995))))
+initial_mart_plot <- initial_mart_points %>% left_join(initial_mart_limits, by = "variable") %>% filter(value <= xmax) %>%
+  ggplot(aes(value, martingale)) + geom_point(alpha = .08, size = .5, colour = "#537A98") +
+  geom_line(data = initial_mart_bins %>% left_join(initial_mart_limits, by = "variable") %>% filter(value <= xmax),
+    aes(y = smooth), linewidth = .9, colour = "#CF7653") + facet_wrap(~variable, scales = "free_x") +
+  labs(title = "Martingale residuals: inspect covariate shape", x = "Transformed covariate value",
+    y = "Reduced-model martingale residual", caption = "Scatter: up to 15,000 loans; estimation and bin means: all loans. Central 99.5% x-range shown.") + project_plot_theme()
+initial_mart_zoom <- initial_mart_bins %>% left_join(initial_mart_limits, by = "variable") %>% filter(value <= xmax) %>%
+  ggplot(aes(value, martingale)) + geom_hline(yintercept = 0, linetype = 2, colour = "#A7854E") +
+  geom_point(aes(size = n), colour = "#537A98") + geom_line(aes(y = smooth), colour = "#CF7653") +
+  facet_wrap(~variable, scales = "free") + scale_size_continuous(guide = "none") +
+  labs(title = "Covariate-shape diagnostic: magnified bin means", x = "10-percentage-point units",
+    y = "Mean martingale residual", caption = "Y axes differ and magnify small changes; not a formal test or a unique transformation rule.") + project_plot_theme()
+initial_mart_plot
+initial_mart_zoom
+  
+save_figure(initial_mart_plot, "initial_martingale")
+save_figure(initial_mart_zoom, "initial_martingale_zoom")
+save_table(initial_mart_bins, "initial_martingale_binned")
+```
+
+## 6. Proportional Hazards Diagnostics and Cutpoint-Based Adjustment (RQ3)
+
+### Graphical Checks of the Proportional Hazards Assumption
+
+**A. Adjusted log cumulative hazard curves.** Approximately parallel curves across grades within the same origination-year panel are consistent with proportional hazards across grades.
+
+```{r}
+#| label: initial-ph-log-cumulative-hazard
+#| fig-width: 12
+#| fig-height: 8
+# Grade-stratified diagnostic fit: other covariate effects are still assumed common.
+f_common <- as.formula(paste("Surv(duration_months, event) ~",
+  paste(c("strata(year_grade)", analysis_variables), collapse = " + ")))
+m_common <- checked_coxph(f_common, data = dat, label = "m_common", ties = "efron", x = TRUE, y = TRUE)
+bh <- basehaz(m_common, centered = TRUE) %>% as.data.frame() %>%
+  mutate(stratum = sub("^year_grade=", "", as.character(strata))) %>%
+  separate(stratum, into = c("issue_year", "grade"), sep = ":")
+initial_bh_grid <- bh %>% filter(issue_year %in% c("2012", "2013", "2014", "2015")) %>%
+  group_by(issue_year, grade) %>% group_modify(~data.frame(time = 1:36,
+    hazard = approx(c(0, .x$time), c(0, .x$hazard), xout = 1:36, method = "constant", rule = 1, ties = max)$y)) %>%
+  ungroup() %>% filter(!is.na(hazard)) %>% as.data.frame()
+  
+initial_grade_reference <- initial_bh_grid %>% filter(grade == "A") %>% select(issue_year, time, hazard_A = hazard)
+initial_bh_grid <- initial_bh_grid %>% left_join(initial_grade_reference, by = c("issue_year", "time"))
+initial_logh_plot <- initial_bh_grid %>% filter(hazard > 0) %>% ggplot(aes(time, log(hazard), colour = grade)) +
+  geom_line() + facet_wrap(~issue_year) + scale_colour_manual(values = grade_colours) +
+  labs(title = "Initial PH check: adjusted log cumulative hazards", x = "Months", y = "Log cumulative hazard",
+    caption = "Parallel curves would support PH across grades within a cohort. Sparse cells and short follow-up limit interpretation.") + project_plot_theme()
+
+initial_logh_plot
+save_figure(initial_logh_plot, "04a_initial_ph_log_cumulative_hazard", height = 8)
+save_table(initial_bh_grid, "initial_ph_baseline_grid")
+```
+
+**B. Cumulative score processes.** Under proportional hazards, the processes are expected to fluctuate around zero without a systematic pattern.
+
+```{r}
+#| label: initial-ph-score-process
+#| fig-width: 12
+#| fig-height: 8
+initial_score_terms <- c("dti10", "util10", "log_annual_inc", "log_revol_bal", "inq_last_6mths")
+
+initial_score_labels <- c(dti10 = "dti (per 10 percentage points)",
+  util10 = "revol_util (per 10 percentage points)", log_annual_inc = "log(annual_inc)",
+  log_revol_bal = "log(1 + revol_bal)", inq_last_6mths = "inq_last_6mths")
+
+initial_schoenfeld <- residuals(m_initial, type = "schoenfeld")
+initial_score_process <- lapply(intersect(initial_score_terms, colnames(initial_schoenfeld)), function(v) {
+  data.frame(time = as.numeric(rownames(initial_schoenfeld)), contribution = initial_schoenfeld[, v]) %>%
+    group_by(time) %>% summarise(contribution = sum(contribution), .groups = "drop") %>%
+    arrange(time) %>% mutate(process = cumsum(contribution) * sqrt(vcov(m_initial)[v, v]),
+      term = v, variable = unname(initial_score_labels[v])) %>% as.data.frame()
+}) %>% bind_rows() %>% as.data.frame()
+  
+initial_score_plot <- initial_score_process %>% ggplot(aes(time, process)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "#A7854E") +
+  geom_line(colour = "#537A98", linewidth = .65) +
+  facet_wrap(~variable, scales = "free_y", ncol = 2) +
+  labs(title = "Initial PH check: cumulative score processes", x = "Months since loan issue",
+    y = "Standardized cumulative score",
+    caption = "Systematic drift suggests departures from PH. No simultaneous confidence bands; panel scales differ.") +
+  project_plot_theme()
+initial_score_plot
+  
+save_figure(initial_score_plot, "04b_initial_ph_score_process", height = 8)
+save_table(initial_score_process, "initial_ph_score_process")
+rm(initial_schoenfeld)
+```
+
+### Cutpoint Selection
+
+```{r}
+#| label: cutpoint-candidates
+cut_min_events <- 5000L
+cut_min_late_loans <- 100000L
+cut_model_variables <- analysis_variables
+cut_model_variables <- analysis_variables
+cut_expected_parameters <- 2L * length(coef(m_common))
+
+focus_terms <- intersect(c("dti10", "util10", "log_annual_inc", "log_revol_bal", "inq_last_6mths"), analysis_variables)
+cut_event_months <- dat %>% filter(event == 1) %>% distinct(duration_months) %>%
+  arrange(duration_months) %>% pull(duration_months)
+
+cut_candidates <- data.frame(tau = cut_event_months) %>%
+  mutate(
+    events_before = vapply(tau, function(t) sum(dat$event == 1 & dat$duration_months <= t), numeric(1)),
+    events_after = sum(dat$event) - events_before,
+    loans_after = vapply(tau, function(t) sum(dat$duration_months > t), numeric(1)),
+    eligible = events_before >= cut_min_events & events_after >= cut_min_events &
+      loans_after >= cut_min_late_loans,
+    support_reason = case_when(
+      events_before < cut_min_events ~ "too few early events",
+      events_after < cut_min_events ~ "too few late events",
+      loans_after < cut_min_late_loans ~ "too few loans at late entry",
+      TRUE ~ "eligible"))
+                           
+cut_candidates %>% print(row.names = FALSE)
+save_table(cut_candidates, "cutpoint_candidates")
+stopifnot(any(cut_candidates$eligible))
+```
+
+```{r}
+#| label: cutpoint-profile
+cutpoint_fit <- function(dataset, stage, tau) {
+  formula <- model_formula(cut_model_variables, "piecewise")
+  signature <- paste(input_hash, analysis_data_hash(dataset), deparse(formula), stage, tau,
+    as.character(packageVersion("survival")), paste(deparse(body(cutpoint_fit)), collapse = "\n"),
+    paste(deparse(body(hr_table)), collapse = "\n"), collapse = "|")
+  tmp <- tempfile(); writeLines(signature, tmp)
+  key <- unname(tools::md5sum(tmp)); unlink(tmp)
+  path <- file.path(cache_dir, paste0("cutpoint_", key, ".rds"))
+  if (use_fit_cache && file.exists(path)) {
+    result <- readRDS(path)
+    result$hr <- as.data.frame(result$hr)
+    return(result)
+  }
+  warnings <- character()
+  result <- tryCatch({
+    model <- withCallingHandlers({
+      coxph(formula, data = dataset, ties = "efron", x = FALSE, y = FALSE)
+    }, warning = function(w) {
+      warnings <<- c(warnings, conditionMessage(w)); invokeRestart("muffleWarning")
+    })
+    valid <- !anyNA(coef(model)) && all(is.finite(coef(model))) &&
+      all(is.finite(diag(vcov(model)))) && all(diag(vcov(model)) > 0) && !length(warnings)
+    list(valid = valid, log_likelihood = as.numeric(logLik(model)),
+      parameters = sum(!is.na(coef(model))), n = model$n, events = model$nevent,
+      hr = if (valid) hr_table(model) else data.frame(),
+      reason = if (length(warnings)) paste(unique(warnings), collapse = "; ") else
+        if (valid) "ok" else "rank or finite-estimate check failed")
+  }, error = function(e) list(valid = FALSE, log_likelihood = NA_real_, parameters = NA_integer_,
+      n = nrow(dataset), events = sum(dataset$event_piece), hr = data.frame(), reason = conditionMessage(e)))
+  if (use_fit_cache) saveRDS(result, path)
+  result
+}
+         
+cutpoint_evaluate <- function(tau) {
+  message("Cutpoint profile: ", tau, " months")
+  before <- dat %>% mutate(tstart = 0, tstop = pmin(duration_months, tau),
+    event_piece = as.integer(event == 1 & duration_months <= tau))
+  after <- dat %>% filter(duration_months > tau) %>%
+    mutate(tstart = tau, tstop = duration_months, event_piece = event)
+  stopifnot(sum(before$event_piece) + sum(after$event_piece) == sum(dat$event),
+            all(after$tstart < after$tstop))
+  a <- cutpoint_fit(before, "early", tau)
+  b <- cutpoint_fit(after, "late", tau)
+  comparable <- a$valid && b$valid && a$parameters + b$parameters == cut_expected_parameters
+  list(profile = data.frame(tau = tau, valid = comparable,
+      log_likelihood = if (comparable) a$log_likelihood + b$log_likelihood else NA_real_,
+      parameters = a$parameters + b$parameters,
+      early_n = a$n, late_n = b$n, early_events = a$events, late_events = b$events,
+      reason = if (comparable) "ok" else paste(a$reason, b$reason, "parameter-count check", sep = "; ")),
+    hr = bind_rows(a$hr %>% mutate(period = "Before cut"), b$hr %>% mutate(period = "After cut")) %>%
+      mutate(tau = tau))
+}
+       
+cut_tau_values <- cut_candidates %>% filter(eligible) %>% pull(tau)
+cut_search_taus <- cut_tau_values
+       
+cut_search_runs <- if (analysis_workers > 1L && length(cut_search_taus)) {
+  cut_cluster <- start_analysis_cluster(analysis_workers,
+    c("dat", "candidate_variables", "cut_model_variables", "cut_expected_parameters",
+      "input_hash", "cache_dir", "use_fit_cache", "model_formula", "analysis_data_hash",
+      "hr_table", "cutpoint_fit", "cutpoint_evaluate"), envir = environment())
+  tryCatch({
+    task <- eval(quote(function(tau) cutpoint_evaluate(tau)), envir = globalenv())
+    parallel::parLapplyLB(cut_cluster, cut_search_taus, task)
+  }, finally = parallel::stopCluster(cut_cluster))
+} else {
+  lapply(cut_search_taus, cutpoint_evaluate)
+}
+                 
+cut_runs <- cut_search_runs
+if (any(vapply(cut_runs, inherits, logical(1), "try-error"))) stop("A cutpoint worker failed; inspect warnings.")
+                 
+cut_profile <- lapply(cut_runs, function(x) x$profile) %>% bind_rows() %>% arrange(tau)
+cut_all_hr <- lapply(cut_runs, function(x) x$hr) %>% bind_rows()
+stopifnot(any(cut_profile$valid))
+                     
+cut_max_ll <- max(cut_profile$log_likelihood, na.rm = TRUE)
+cut_profile <- cut_profile %>% mutate(
+  relative_log_likelihood = log_likelihood - cut_max_ll,
+  delta_2loglik = 2 * (cut_max_ll - log_likelihood))
+                     
+cut_best <- cut_profile %>% filter(valid) %>% arrange(desc(log_likelihood), tau) %>% slice(1)
+cut_best_tau <- cut_best$tau
+split_month <- as.integer(cut_best_tau)
+stopifnot(is.finite(split_month), split_month > 0)
+                     
+cut_summary <- cut_best %>% mutate(
+  candidate_min = min(cut_tau_values), candidate_max = max(cut_tau_values),
+  n_eligible = length(cut_tau_values), n_valid = sum(cut_profile$valid),
+  boundary_maximum = tau %in% range(cut_profile$tau[cut_profile$valid]),
+  n_tied_maxima = sum(abs(cut_profile$log_likelihood - cut_max_ll) < 1e-6, na.rm = TRUE))
+cut_summary
+                     
+cut_profile %>% print(row.names = FALSE)
+save_table(cut_summary, "cutpoint_summary")
+save_table(cut_profile, "cutpoint_profile")
+save_table(cut_all_hr, "cutpoint_all_hr")
+```
+
+```{r}
+#| label: cutpoint-figures
+reference_split_month <- 12L
+cut_profile_plot <- cut_profile %>% filter(valid) %>%
+  ggplot(aes(tau, relative_log_likelihood)) + geom_line(colour = "#537A98", linewidth = .8) +
+  geom_point(colour = "#355C75", size = 2) +
+  geom_vline(xintercept = reference_split_month, linetype = 2, colour = "#A7854E") +
+  geom_vline(xintercept = cut_best_tau, linetype = 3, colour = "#CF7653") +
+  scale_x_continuous(breaks = sort(unique(c(seq(0, max(cut_tau_values), 3), cut_best_tau)))) +
+  labs(title = "Exploratory profile over time cutpoints",
+    subtitle = paste0("Best eligible split: ", cut_best_tau, " months | fixed covariates and grade/year strata"),
+    x = "Candidate split (months)", y = "Log partial likelihood relative to maximum",
+    caption = "Dashed: 12-month reference; dotted: selected primary split. All regression coefficients may change at the cut.\nThe profile is descriptive: no confidence interval or ordinary chi-square p-value for the searched cutpoint.") +
+  project_plot_theme()
+cut_profile_plot
+save_figure(cut_profile_plot, "14_cutpoint_profile")
+cut_nearby_taus <- cut_profile %>% filter(valid, abs(tau - cut_best_tau) <= 2 | tau == reference_split_month) %>% pull(tau)
+cut_neighborhood <- cut_all_hr %>% filter(tau %in% cut_nearby_taus, term %in% focus_terms) %>%
+  arrange(term, tau, period)
+cut_neighborhood %>% print(row.names = FALSE)
+save_table(cut_neighborhood, "cutpoint_neighborhood_hr")
+cut_neighborhood_plot <- cut_neighborhood %>% ggplot(aes(tau, HR, colour = period)) +
+  geom_hline(yintercept = 1, linetype = 2, colour = "#A7854E") +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = .25, position = position_dodge(width = .35)) +
+  geom_point(position = position_dodge(width = .35), size = 2) +
+  facet_wrap(~term, scales = "free_y") + scale_y_log10() +
+  scale_colour_manual(values = c("After cut" = "#CF7653", "Before cut" = "#537A98")) +
+  scale_x_continuous(breaks = cut_nearby_taus) +
+  labs(title = "HR sensitivity near the selected cutpoint",
+    subtitle = "Selected split +/- 2 eligible months, plus the 12-month reference split",
+    x = "Candidate split (months)", y = "Hazard ratio (conditional 95% CI)",
+    caption = "Same loans are reused; these are not independent replications. Intervals condition on each cut and the fixed variables.\nNo variable reselection is performed. The maximum-likelihood candidate defines the primary split.") + project_plot_theme()
+cut_neighborhood_plot
+save_figure(cut_neighborhood_plot, "15_cutpoint_neighborhood", height = 8)
+```
+
+### Piecewise Cox
+
+```{r}
+#| label: period-data
+early_data <- dat %>% mutate(tstart = 0, tstop = pmin(duration_months, split_month),
+  event_piece = as.integer(event == 1 & duration_months <= split_month))
+late_data <- dat %>% filter(duration_months > split_month) %>%
+  mutate(tstart = split_month, tstop = duration_months, event_piece = event)
+stopifnot(sum(early_data$event_piece) + sum(late_data$event_piece) == sum(dat$event),
+          all(late_data$tstart < late_data$tstop))
+period_counts <- data.frame(period = c("0-6 months", "After 6 months"),
+  n_at_entry = c(nrow(early_data), nrow(late_data)),
+  events = c(sum(early_data$event_piece), sum(late_data$event_piece)))
+period_counts
+save_table(period_counts, "period_counts")
+```
+
+```{r}
+#| label: final-models
+f_piece <- model_formula(analysis_variables, "piecewise")
+final_nested <- fit_group_set(list(early_data, late_data), "piecewise", "refined")
+final_group_tests <- nested_lr_table(final_nested$metrics)
+final_nested$metrics
+final_group_tests %>% print(row.names = FALSE)
+save_table(final_nested$metrics, "final_nested_models")
+save_table(final_group_tests, "final_group_lr_tests")
+
+final_group_slide <- group_slide_table(final_group_tests, "refined_piecewise")
+final_group_slide %>% print(row.names = FALSE)
+save_table(final_group_slide, "final_group_slide_table")
+
+m_early <- final_nested$full_fits[[1]]
+m_late <- final_nested$full_fits[[2]]
+final_hr <- list(early_0_6 = m_early, late_after6 = m_late) %>%
+  lapply(hr_table) %>% bind_rows(.id = "period")
+final_hr %>% print(row.names = FALSE)
+final_ph <- bind_rows(ph_table(m_common, "grade_year_common"),
+  ph_table(m_early, "early_0_6"), ph_table(m_late, "late_after6"))
+
+ph_overview <- bind_rows(initial_ph, final_ph) %>% group_by(model) %>%
+  summarise(global_p = p_value[term == "GLOBAL"],
+    n_terms_flagged = sum(p_value[term != "GLOBAL"] < .05), .groups = "drop") %>% as.data.frame()
+save_table(ph_overview, "ph_overview")
+  
+common_ll <- as.numeric(logLik(m_common))
+piece_ll <- as.numeric(logLik(m_early)) + as.numeric(logLik(m_late))
+common_p <- length(coef(m_common)); piece_p <- length(coef(m_early)) + length(coef(m_late))
+time_lrt <- data.frame(chisq = 2 * (piece_ll - common_ll), df = piece_p - common_p) %>%
+  mutate(p_value = pchisq(chisq, df, lower.tail = FALSE))
+time_lrt
+  
+period_tests <- hr_table(m_early) %>% select(term, beta_early = beta, se_early = se) %>%
+  inner_join(hr_table(m_late) %>% select(term, beta_late = beta, se_late = se), by = "term") %>%
+  mutate(chisq = (beta_early - beta_late)^2 / (se_early^2 + se_late^2),
+         p_value = pchisq(chisq, 1, lower.tail = FALSE))
+save_table(final_hr, "final_piecewise_hr")
+save_table(final_ph, "final_ph")
+save_table(time_lrt, "time_effect_lrt")
+save_table(period_tests, "period_tests")
+  
+model_dimensions <- data.frame(
+  model = c("Initial MABC", "Common grade/year-stratified MABC", "Piecewise MABC"),
+  original_variables = length(analysis_variables),
+  coefficients = c(length(coef(m_initial)), length(coef(m_common)),
+    length(coef(m_early)) + length(coef(m_late))))
+  
+core_fit_status <- bind_rows(fit_status(m_initial, "initial_MABC"),
+  fit_status(m_common, "grade_year_common_MABC"), fit_status(m_early, "early_0_6"),
+  fit_status(m_late, "late_after6")) %>% as.data.frame()
+stopifnot(all(core_fit_status$fit_ok))
+  
+model_dimensions
+core_fit_status
+save_table(model_dimensions, "model_dimensions")
+save_table(core_fit_status, "core_fit_status")
+```
+
+```{r}
+#| label: final-effect-plot
+credit_terms <- c("dti10", "util10", "log_annual_inc", "log_revol_bal", "inq_last_6mths")
+focus_terms <- intersect(credit_terms, analysis_variables)
+# If no focal variable is available, display the other numeric variables.
+if (!length(focus_terms)) focus_terms <- intersect(analysis_variables, unique(final_hr$term))
+forest_data <- final_hr %>% filter(term %in% focus_terms) %>%
+  mutate(term = factor(term, levels = rev(focus_terms)))
+final_forest <- forest_data %>% ggplot(aes(HR, term, colour = period)) +
+  geom_vline(xintercept = 1, linetype = 2, colour = "#A7854E") +
+  geom_errorbar(aes(xmin = lower, xmax = upper), orientation = "y", width = .15,
+                position = position_dodge(width = .5)) +
+  geom_point(position = position_dodge(width = .5), size = 2.5) +
+  scale_colour_manual(values = c("#537A98", "#CF7653"), labels = c("0-6 months", "After 6 months")) +
+  scale_x_log10() + labs(title = "Associations in the full A+B+C model by time period",
+    subtitle = "Full A+B+C adjustment | grade/year-stratified baseline hazards",
+    x = "Hazard ratio (95% CI)", y = NULL,
+    caption = "Units: dti10/util10 +10 percentage points; log_annual_inc +1; log_revol_bal +1; inquiries +1.
+Exploratory grouped-model estimates; within-period PH must still be checked.") + project_plot_theme()
+final_forest
+save_figure(final_forest, "05_final_piecewise_hr")
+```
+
+## 8. Piecewise Cox Regression Diagnostics
+
+### Cox–Snell
+
+```{r}
+#| label: final-residuals
+mart_initial <- as.numeric(residuals(m_initial, type = "martingale"))
+mart_common <- as.numeric(residuals(m_common, type = "martingale"))
+expected_early <- early_data$event_piece - as.numeric(residuals(m_early, type = "martingale"))
+expected_late <- late_data$event_piece - as.numeric(residuals(m_late, type = "martingale"))
+expected_final <- expected_early
+expected_final[late_data$row_id] <- expected_final[late_data$row_id] + expected_late
+residual_data <- dat %>% select(row_id, id, duration_months, event, loan_status, grade,
+                                dti, revol_util, inq_last_6mths) %>%
+  mutate(cox_snell_initial = pmax(0, event - mart_initial),
+    cox_snell_common = pmax(0, event - mart_common),
+    cox_snell_final = pmax(0, expected_final), martingale_final = event - cox_snell_final,
+    deviance_final = sign(martingale_final) * sqrt(pmax(0, -2 *
+      (martingale_final + event * log(pmax(cox_snell_final, .Machine$double.eps))))))
+stopifnot(abs(sum(residual_data$martingale_final)) < 1e-4,
+          all(residual_data$cox_snell_final >= 0))
+cs_curve <- function(residual, event, model) {
+  fit <- survfit(Surv(residual, event) ~ 1, stype = 2, ctype = 1, se.fit = FALSE)
+  keep <- unique(round(seq(1, length(fit$time), length.out = min(2000L, length(fit$time)))))
+  data.frame(model = model, residual = fit$time[keep], cumulative_hazard = fit$cumhaz[keep], at_risk = fit$n.risk[keep])
+}
+cs_data <- bind_rows(cs_curve(residual_data$cox_snell_initial, dat$event, "Initial MABC"),
+  cs_curve(residual_data$cox_snell_common, dat$event, "Grade/year common"),
+  cs_curve(residual_data$cox_snell_final, dat$event, "Final piecewise"))
+cs_limit <- unname(quantile(residual_data$cox_snell_initial, .99))
+cs_plot <- cs_data %>% filter(residual <= cs_limit) %>%
+  ggplot(aes(residual, cumulative_hazard, colour = model)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "#A7854E") + geom_step(linewidth = .8) +
+  scale_colour_manual(values = c("#57A698", "#537A98", "#CF7653")) + coord_equal() +
+  labs(title = "Cox-Snell residuals: overall model fit", x = "Cox-Snell residual",
+    y = "Nelson-Aalen cumulative hazard", subtitle = "All models estimated on the full dataset",
+    caption = "Curves show exact full-data estimates at a thinned display grid; central residual range only.
+Agreement with the reference line does not establish PH or resolve proxy-time and censoring limitations.") + project_plot_theme()
+cs_plot
+save_figure(cs_plot, "06_cox_snell")
+save_table(cs_data, "cox_snell_curves")
+```
+
+### Functional Form of Covariates with Martingale Residuals
+
+```{r}
+#| label: martingale-shape
+set.seed(20261118)
+scatter_rows <- sample.int(nrow(dat), min(15000L, nrow(dat)))
+mart_bins <- list(); mart_points <- list()
+for (variable in c("dti10", "log_annual_inc")) {
+  reduced_terms <- setdiff(analysis_variables, variable)
+  reduced_formula <- model_formula(reduced_terms, "piecewise")
+  reduced_early <- coxph(reduced_formula, data = early_data, ties = "efron")
+  reduced_late <- coxph(reduced_formula, data = late_data, ties = "efron")
+  reduced_expected <- early_data$event_piece - as.numeric(residuals(reduced_early, type = "martingale"))
+  reduced_expected[late_data$row_id] <- reduced_expected[late_data$row_id] +
+    late_data$event_piece - as.numeric(residuals(reduced_late, type = "martingale"))
+  z <- data.frame(value = dat[[variable]], martingale = dat$event - reduced_expected)
+  mart_points[[variable]] <- z %>% slice(scatter_rows) %>% mutate(variable = variable)
+  breaks <- unique(quantile(z$value, probs = seq(0, 1, length.out = 81)))
+  bins <- z %>% mutate(bin = cut(value, breaks, include.lowest = TRUE)) %>% group_by(bin) %>%
+    summarise(value = mean(value), martingale = mean(martingale), n = n(), .groups = "drop") %>% arrange(value) %>% as.data.frame()
+  smoothed <- lowess(bins$value, bins$martingale, f = .35)
+  bins <- bins %>% mutate(smooth = approx(smoothed$x, smoothed$y, xout = value, ties = mean, rule = 2)$y,
+                          variable = variable)
+  mart_bins[[variable]] <- bins
+  rm(reduced_early, reduced_late)
+}
+mart_bins <- bind_rows(mart_bins)
+mart_points <- bind_rows(mart_points)
+mart_limits <- data.frame(variable = c("dti10", "log_annual_inc"),
+  xmax = c(unname(quantile(dat$dti10, .995)), unname(quantile(dat$log_annual_inc, .995))))
+mart_plot <- mart_points %>% left_join(mart_limits, by = "variable") %>% filter(value <= xmax) %>%
+  ggplot(aes(value, martingale)) + geom_point(alpha = .08, size = .2, colour = "#537A98") +
+  geom_line(data = mart_bins %>% left_join(mart_limits, by = "variable") %>% filter(value <= xmax),
+    aes(y = smooth), linewidth = .9, colour = "#CF7653") + facet_wrap(~variable, scales = "free_x") +
+  labs(title = "Martingale residuals: inspect covariate shape", x = "Transformed covariate value",
+    y = "Reduced-model martingale residual", caption = "Scatter: up to 15,000 loans; estimation and bin means: all loans. Central 99.5% x-range shown.") + project_plot_theme()
+mart_zoom <- mart_bins %>% left_join(mart_limits, by = "variable") %>% filter(value <= xmax) %>%
+  ggplot(aes(value, martingale)) + geom_hline(yintercept = 0, linetype = 2, colour = "#A7854E") +
+  geom_point(aes(size = n), colour = "#537A98") + geom_line(aes(y = smooth), colour = "#CF7653") +
+  facet_wrap(~variable, scales = "free") + scale_size_continuous(guide = "none") +
+  labs(title = "Covariate-shape diagnostic: magnified bin means", x = "10-percentage-point units",
+    y = "Mean martingale residual", caption = "Y axes differ and magnify small changes; not a formal test or a unique transformation rule.") + project_plot_theme()
+mart_plot
+mart_zoom
+save_figure(mart_plot, "07_martingale")
+save_figure(mart_zoom, "08_martingale_zoom")
+save_table(mart_bins, "martingale_binned")
+```
+
+### Cumulative Score Processes Before and After the Proportional Hazards Adjustment
+
+```{r}
+#| label: ph-graphics
+score_process <- list()
+for (label in c("initial", "early", "late")) {
+  model <- switch(label, initial = m_initial, early = m_early, late = m_late)
+  sch <- residuals(model, type = "schoenfeld")
+  selected <- intersect(credit_terms, colnames(sch))
+  score_process[[label]] <- lapply(selected, function(term) {
+    data.frame(time = as.numeric(rownames(sch)), contribution = sch[, term]) %>% group_by(time) %>%
+      summarise(contribution = sum(contribution), .groups = "drop") %>% arrange(time) %>%
+      mutate(process = cumsum(contribution) * sqrt(vcov(model)[term, term]), term = term, model = label) %>% as.data.frame()
+  }) %>% bind_rows()
+}
+  
+score_process <- bind_rows(score_process)
+if (nrow(score_process)) {
+  score_plot <- score_process %>% ggplot(aes(time, process)) + geom_line(colour = "#537A98") +
+    geom_hline(yintercept = 0, linetype = 2, colour = "#A7854E") + facet_wrap(vars(model, term), scales = "free") +
+    labs(title = "Score processes before and after refinement", x = "Months", y = "Standardized cumulative score",
+      caption = "Systematic drift flags departures; separate panels use different scales and observation windows. No simultaneous bands.") + project_plot_theme()
+  print(score_plot)
+  save_figure(score_plot, "11_score_process", height = 10)
+  save_table(score_process, "score_process")
+}
+rm(sch)
+```
+
+### Unusual Observations in the Final Model with Deviance Residuals
+
+```{r}
+#| label: deviance
+deviance_plot <- residual_data %>% slice(scatter_rows) %>%
+  ggplot(aes(log1p(cox_snell_final), deviance_final)) + geom_point(alpha = .15, size = .6, colour = "#537A98") +
+  geom_hline(yintercept = 0, linetype = 2, colour = "#A7854E") +
+  labs(title = "Deviance residuals: final piecewise model", x = "log(1 + fitted cumulative hazard)",
+    y = "Deviance residual", caption = "Calculated for all loans; only the scatter is sampled. No normality assumption or automatic deletion.") + project_plot_theme()
+deviance_plot
+save_figure(deviance_plot, "12_deviance")
+  
+deviance_top30 <- residual_data %>% arrange(desc(abs(deviance_final))) %>% slice_head(n = 30)
+deviance_top30 %>% slice_head(n = 10)
+save_table(deviance_top30, "deviance_top30")
+```
+
+### Influential Observations in the Final Model with Score-Based DFBETAS
+
+```{r}
+#| label: influence
+max_influence <- rep(0, nrow(dat)); affected_term <- rep(NA_character_, nrow(dat))
+influence_terms <- list()
+for (label in c("early", "late")) {
+  model <- if (label == "early") m_early else m_late
+  rows <- if (label == "early") early_data$row_id else late_data$row_id
+  dfb <- residuals(model, type = "dfbetas")
+  stopifnot(ncol(dfb) == length(coef(model)), nrow(dfb) == length(rows))
+  colnames(dfb) <- names(coef(model))
+  for (term in colnames(dfb)) {
+    values <- abs(dfb[, term])
+    larger <- values > max_influence[rows]
+    max_influence[rows[larger]] <- values[larger]
+    affected_term[rows[larger]] <- paste(label, term, sep = ":")
+  }
+  influence_terms[[label]] <- data.frame(period = label, term = colnames(dfb),
+    max_abs_dfbetas = vapply(seq_len(ncol(dfb)), function(j) max(abs(dfb[, j])), numeric(1)))
+  rm(dfb)
+}
+                             
+influence_data <- dat %>% select(row_id, id, duration_months, event, grade, dti, revol_util, inq_last_6mths) %>%
+  mutate(max_abs_dfbetas = max_influence, affected_term = affected_term) %>% arrange(desc(max_abs_dfbetas))
+                             
+influence_summary <- data.frame(n = nrow(dat), maximum = max(max_influence), threshold = 2 / sqrt(nrow(dat)),
+  n_above_heuristic = sum(max_influence > 2 / sqrt(nrow(dat))))
+                             
+influence_summary
+                             
+influence_data %>% slice_head(n = 10)             
+influence_plot <- influence_data %>% filter(row_id %in% scatter_rows) %>%
+  bind_rows(influence_data %>% slice_head(n = 30)) %>% distinct(row_id, .keep_all = TRUE) %>%
+  ggplot(aes(row_id, max_abs_dfbetas)) + geom_point(alpha = .35, size = .7, colour = "#537A98") +
+  geom_hline(yintercept = 2 / sqrt(nrow(dat)), linetype = 2, colour = "#A7854E") +
+  labs(title = "Influence: final model, both periods", x = "Original row index", y = "Maximum absolute DFBETAS",
+    caption = "Display: up to 15,000 sampled loans plus 30 largest influences. The heuristic threshold is not a deletion rule.") + project_plot_theme()
+influence_plot
+                             
+save_figure(influence_plot, "13_influence")
+save_table(influence_data %>% slice_head(n = 30), "influence_top30")
+save_table(influence_summary, "influence_summary")
+save_table(bind_rows(influence_terms), "influence_by_term")
+                             
+drop_ids <- influence_data %>% slice_head(n = 10) %>% pull(row_id)
+early_sensitivity <- early_data %>% filter(!row_id %in% drop_ids)
+late_sensitivity <- late_data %>% filter(!row_id %in% drop_ids)
+                             
+m_early_delete <- checked_coxph(f_piece, data = early_sensitivity, label = "exclude_top10_early", ties = "efron")
+m_late_delete <- checked_coxph(f_piece, data = late_sensitivity, label = "exclude_top10_late", ties = "efron")
+                             
+influence_sensitivity <- bind_rows(final_hr %>% mutate(analysis = "all_loans"),
+  hr_table(m_early_delete) %>% mutate(period = "early_0_6", analysis = "exclude_top10"),
+  hr_table(m_late_delete) %>% mutate(period = "late_after6", analysis = "exclude_top10")) %>%
+  filter(term %in% focus_terms) %>% select(analysis, period, everything())
+                             
+influence_sensitivity %>% print(row.names = FALSE)
+influence_refit_status <- bind_rows(fit_status(m_early_delete, "exclude_top10_early"),
+  fit_status(m_late_delete, "exclude_top10_late")) %>% as.data.frame()
+                             
+influence_refit_status
+                             
+influence_sensitivity <- influence_sensitivity %>% mutate(fit_ok = ifelse(analysis == "all_loans", TRUE,
+  ifelse(period == "early_0_6", influence_refit_status$fit_ok[1], influence_refit_status$fit_ok[2])))
+                             
+influence_sensitivity %>% print(row.names = FALSE)
+save_table(influence_refit_status, "influence_refit_status")
+                             
+influence_sensitivity <- influence_sensitivity %>% mutate(fit_ok = ifelse(analysis == "all_loans", TRUE,
+  ifelse(period == "early_0_6", influence_refit_status$fit_ok[1], influence_refit_status$fit_ok[2])))
+influence_sensitivity %>% print(row.names = FALSE)
+save_table(influence_sensitivity, "influence_sensitivity")
+```
+
+```{r}
+#| label: refined-diagnostics-ppt-panel
+#| fig-width: 16
+#| fig-height: 10
+ppt_diag_theme <- project_plot_theme() + theme(
+  plot.title = element_text(size = 15, face = "bold"),
+  plot.subtitle = element_text(size = 10), plot.caption = element_text(size = 9),
+  axis.title = element_text(size = 11), axis.text = element_text(size = 10),
+  strip.text = element_text(size = 10), legend.text = element_text(size = 10),
+  plot.margin = margin(8, 12, 8, 12))
+
+ppt_cs_data <- cs_data %>% filter(model %in% c("Initial MABC", "Final piecewise"), residual <= .4) %>%
+  as.data.frame()
+ppt_cs <- ppt_cs_data %>% ggplot(aes(residual, cumulative_hazard, colour = model)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "#A7854E") +
+  geom_step(linewidth = .8) + coord_equal() +
+  scale_colour_manual(values = c("Initial MABC" = "#91A9B8", "Final piecewise" = "#355C75")) +
+  labs(title = "A. Overall fit: Cox-Snell", x = "Cox-Snell residual",
+    y = "Nelson-Aalen cumulative hazard", colour = NULL,
+    caption = "Displayed residual range: 0-0.4. Dashed line: y = x.") + ppt_diag_theme
+
+ppt_influence_data <- bind_rows(influence_terms) %>% group_by(term) %>%
+  summarise(max_abs_dfbetas = max(max_abs_dfbetas), .groups = "drop") %>%
+  arrange(desc(max_abs_dfbetas)) %>% slice_head(n = 6) %>%
+  mutate(term = factor(term, levels = rev(term))) %>% as.data.frame()
+ppt_influence <- ppt_influence_data %>% ggplot(aes(max_abs_dfbetas, term)) +
+  geom_segment(aes(x = 0, xend = max_abs_dfbetas, yend = term), colour = "#91A9B8", linewidth = .9) +
+  geom_point(colour = "#355C75", size = 2.5) +
+  labs(title = "B. Influence: most sensitive coefficients", x = "Maximum absolute DFBETAS", y = NULL,
+    caption = "Maximum across loans and both periods; top six coefficients. No automatic deletion.") + ppt_diag_theme
+
+ppt_score_data <- score_process %>%
+  filter(model %in% c("early", "late"), term %in% c("dti10", "log_annual_inc")) %>%
+  mutate(period = factor(model, levels = c("early", "late"), labels = c("0-6 months", "After 6 months")),
+    variable = factor(term, levels = c("dti10", "log_annual_inc"), labels = c("dti (+10 percentage points)", "log(annual_inc)"))) %>%
+  as.data.frame()
+ppt_score <- ppt_score_data %>% ggplot(aes(time, process)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "#A7854E") +
+  geom_line(colour = "#537A98", linewidth = .7) +
+  facet_grid(variable ~ period, scales = "free") +
+  labs(title = "C. Within-period PH: cumulative score processes", x = "Months since loan issue",
+    y = "Standardized cumulative score",
+    caption = "Systematic drift suggests residual time variation. Different risk sets; no simultaneous confidence bands.") +
+  ppt_diag_theme
+
+ppt_diag_grobs <- lapply(list(ppt_cs, ppt_influence, ppt_score), ggplotGrob)
+for (i in seq_along(ppt_diag_grobs)) ppt_diag_grobs[[i]]$name <- paste0("diagnostic_panel_", i)
+ppt_diag_grobs[[1]]$vp <- grid::viewport(layout.pos.row = 1, layout.pos.col = 1)
+ppt_diag_grobs[[2]]$vp <- grid::viewport(layout.pos.row = 1, layout.pos.col = 2)
+ppt_diag_grobs[[3]]$vp <- grid::viewport(layout.pos.row = 2, layout.pos.col = 1:2)
+refined_diagnostics_panel <- grid::grobTree(
+  children = do.call(grid::gList, ppt_diag_grobs),
+  vp = grid::viewport(layout = grid::grid.layout(2, 2, heights = grid::unit(c(.46, .54), "null"))))
+grid::grid.newpage()
+grid::grid.draw(refined_diagnostics_panel)
+save_figure(refined_diagnostics_panel, "17_refined_diagnostics_ppt", width = 16, height = 10)
+save_table(ppt_influence_data, "ppt_influence_coefficients")
+```
+
+```{r}
+#| label: cutpoint-conditional-diagnostics
+# The selected-cut fits are the primary models; no separate auxiliary refit is needed.
+cut_best_early_model <- m_early
+cut_best_late_model <- m_late
+stopifnot(split_month == cut_best_tau,
+  abs(as.numeric(logLik(m_early)) + as.numeric(logLik(m_late)) - cut_max_ll) < 1e-5)
+cut_best_ph <- bind_rows(ph_table(cut_best_early_model, "selected_before_cut"),
+                         ph_table(cut_best_late_model, "selected_after_cut")) %>% mutate(tau = cut_best_tau)
+invisible(cut_best_ph) # supplementary formal tests only
+save_table(cut_best_ph, "cutpoint_conditional_ph")
+
+```
+
+### Sensitivity Analysis for the Final Model
+
+```{r}
+#| label: sensitivity
+sensitivity_datasets <- list(
+  without_late = dat %>% filter(!loan_status %in% c("Late (16-30 days)", "Late (31-120 days)")),
+  utilization_le100 = dat %>% filter(revol_util <= 100),
+  issued_through2014 = dat %>% filter(as.integer(as.character(issue_year)) <= 2014),
+  financial_only = dat,
+  omit_contract_group = dat,
+  omit_background_group = dat,
+  without_rare_housing = dat %>% filter(as.character(home_ownership) != "OTHER") %>%
+    mutate(home_ownership = droplevels(home_ownership)),
+  term_stratified = dat %>% mutate(year_grade = interaction(year_grade, term_months, sep = ":", drop = TRUE))
+)
+  
+sensitivity_runs <- lapply(names(sensitivity_datasets), function(label) {
+  dataset <- sensitivity_datasets[[label]]
+  variables <- switch(label,
+    financial_only = model_specs$MA,
+    omit_contract_group = model_specs$MAC,
+    omit_background_group = model_specs$MAB,
+    term_stratified = setdiff(analysis_variables, "term_months"),
+    analysis_variables)
+  formula <- model_formula(variables, "piecewise")
+  early <- dataset %>% mutate(tstart = 0, tstop = pmin(duration_months, split_month),
+    event_piece = as.integer(event == 1 & duration_months <= split_month))
+  late <- dataset %>% filter(duration_months > split_month) %>%
+    mutate(tstart = split_month, tstop = duration_months, event_piece = event)
+  e <- checked_coxph(formula, early, paste0(label, "_early"), ties = "efron")
+  l <- checked_coxph(formula, late, paste0(label, "_late"), ties = "efron")
+  status <- bind_rows(fit_status(e, paste0(label, "_early")) %>% mutate(period = "early_0_6"),
+    fit_status(l, paste0(label, "_late")) %>% mutate(period = "late_after6")) %>%
+    mutate(analysis = label) %>% as.data.frame()
+  hr <- bind_rows(hr_table(e) %>% mutate(period = "early_0_6"),
+    hr_table(l) %>% mutate(period = "late_after6")) %>% mutate(analysis = label) %>%
+    left_join(status %>% select(period, fit_ok), by = "period") %>% as.data.frame()
+  ph <- if (label == "term_stratified" && all(status$fit_ok)) bind_rows(
+    ph_table(e, "term_stratified_early"), ph_table(l, "term_stratified_late")) %>% as.data.frame() else
+    data.frame(model = character(), term = character(), chisq = numeric(), df = numeric(), p_value = numeric())
+  list(hr = hr, status = status, ph = ph)
+})
+  
+reference_hr <- final_hr %>% mutate(analysis = "all_loans", fit_ok = TRUE)
+sensitivity_all_hr <- bind_rows(reference_hr,
+  lapply(sensitivity_runs, function(z) z$hr) %>% bind_rows()) %>% as.data.frame()
+         
+sensitivity_fit_status <- lapply(sensitivity_runs, function(z) z$status) %>% bind_rows() %>% as.data.frame()
+sensitivity_results <- sensitivity_all_hr %>% filter(term %in% focus_terms) %>% as.data.frame()
+sensitivity_term_ph <- lapply(sensitivity_runs, function(z) z$ph) %>% bind_rows() %>% as.data.frame()
+invisible(sensitivity_term_ph %>% filter(term == "GLOBAL"))
+save_table(sensitivity_term_ph, "sensitivity_term_ph")
+                              
+sensitivity_reference <- reference_hr %>% select(period, term, HR_reference = HR, beta_reference = beta)
+sensitivity_contrasts <- sensitivity_results %>% filter(analysis != "all_loans") %>%
+  left_join(sensitivity_reference, by = c("period", "term")) %>%
+  mutate(HR_ratio_to_reference = HR / HR_reference,
+    HR_percent_change = 100 * (HR_ratio_to_reference - 1),
+    absolute_logHR_change = abs(beta - beta_reference),
+    logHR_ratio_to_reference = ifelse(abs(beta_reference) > .01, beta / beta_reference, NA_real_),
+    same_direction = sign(beta) == sign(beta_reference)) %>% as.data.frame()
+                              
+sensitivity_summary <- sensitivity_contrasts %>% filter(fit_ok) %>% group_by(period, term) %>%
+  summarise(n_valid_checks = n(), min_HR = min(HR), max_HR = max(HR),
+    max_abs_HR_percent_change = max(abs(HR_percent_change)),
+    max_abs_logHR_change = max(absolute_logHR_change),
+    all_same_direction = all(same_direction), .groups = "drop") %>% as.data.frame()
+sensitivity_fit_status
+sensitivity_summary
+                              
+sensitivity_results %>% print(row.names = FALSE)
+save_table(sensitivity_all_hr, "sensitivity_all_hr")
+save_table(sensitivity_fit_status, "sensitivity_fit_status")
+save_table(sensitivity_results, "sensitivity_results")
+save_table(sensitivity_contrasts, "sensitivity_contrasts")
+save_table(sensitivity_summary, "sensitivity_summary")
+                              
+sensitivity_plot <- sensitivity_results %>% filter(fit_ok) %>%
+  mutate(primary = analysis == "all_loans") %>%
+  ggplot(aes(HR, analysis, colour = primary)) +
+  geom_vline(xintercept = 1, linetype = 2, colour = "#A8B5BE") +
+  geom_errorbar(aes(xmin = lower, xmax = upper), orientation = "y", width = .15) +
+  geom_point(size = 2.3) + facet_wrap(vars(term, period), scales = "free_x", ncol = 2) +
+  scale_x_log10() + scale_colour_manual(values = c("FALSE" = "#91A9B8", "TRUE" = "#365D78"), guide = "none") +
+  labs(title = "Grouped Cox: sensitivity of key associations", x = "Hazard ratio (95% CI)", y = NULL,
+    caption = "Selected 6-month split and grade/year strata. Group-omission checks change the adjustment set.
+Without-late restricts both outcome definition and sample; intervals are exploratory and nominal.") + project_plot_theme()
+                              
+sensitivity_plot
+save_figure(sensitivity_plot, "16_grouped_sensitivity", height = 9)
+```
+
+## 10. Supplementary Analysis of Competing Risks
+
+### Event Definitions and Target of Estimation
+
+- After origination, each loan is assumed to transition to the first observed outcome, either the composite delinquency or default event (`event_type=1`) or repayment in full (`event_type=2`).
+
+- A value of 0 for `event_type` indicates the end of follow-up. Repayment in full is a competing event because it precludes subsequent delinquency or default on the same loan.
+
+- The Fully Paid status does not distinguish early repayment from repayment at maturity, so both are treated as repayment in full.
+
+- The data cannot reconstruct prior delinquencies followed by recovery or repayment. The estimates therefore describe cumulative incidence for the outcomes defined in preprocessing using the last payment month as a proxy for event time. Estimating lifetime risk of first delinquency would require complete delinquency histories.
+
+```{r}
+#| label: cr-integrated-setup
+cr_covariates <- analysis_variables
+primary_hr <- final_hr
+primary_ph_overview <- ph_overview
+cause_labels <- c(distress = "Distress", paid = "Fully paid")
+dat <- dat %>% mutate(cr_status = factor(event_type, levels = c(0, 1, 2), labels = c("censored", "distress", "paid")))
+event_counts <- dat %>% count(cr_status, name = "n") %>% mutate(percent = 100*n/sum(n)) %>% as.data.frame()
+event_counts
+save_table(event_counts, "cr_event_counts")
+```
+
+### A. Aalen–Johansen Cumulative Incidence by Credit Grade
+
+We use `cmprsk::cuminc()` to estimate the cumulative incidence function for each event type.
+
+```{r}
+#| label: aj-models
+ci_grade <- cmprsk::cuminc(ftime = dat$duration_months, fstatus = dat$event_type,
+  group = dat$grade, cencode = 0, rho = 0)
+
+ci_overall <- cmprsk::cuminc(ftime = dat$duration_months, fstatus = dat$event_type,
+  cencode = 0)
+
+ci_stratified <- cmprsk::cuminc(ftime = dat$duration_months,
+  fstatus = dat$event_type, group = dat$grade, strata = dat$issue_year,
+  cencode = 0, rho = 0)
+
+ci_extract <- function(fit, times = NULL, grouped = TRUE) {
+  keys <- setdiff(names(fit), "Tests")
+  lapply(keys, function(key) {
+    fields <- strsplit(key, " ", fixed = TRUE)[[1]]
+    grade_value <- if (grouped) fields[1] else "All"
+    cause <- if (tail(fields, 1) == "1") "distress" else "paid"
+    curve <- fit[[key]]
+    group_time <- if (grouped) dat$duration_months[as.character(dat$grade) == grade_value] else dat$duration_months
+    if (is.null(times)) {
+      keep <- !duplicated(curve$time, fromLast = TRUE)
+      month <- curve$time[keep]; estimate <- curve$est[keep]; variance <- curve$var[keep]
+    } else {
+      if (any(times > max(group_time))) stop("Requested CIF exceeds observed support")
+      point <- cmprsk::timepoints(fit, times)
+      month <- times; estimate <- as.numeric(point$est[key, ]); variance <- as.numeric(point$var[key, ])
+    }
+    risk <- vapply(month, function(t) sum(group_time >= t), numeric(1))
+    data.frame(grade = grade_value, month = month, at_risk = risk, cause = cause, CIF = estimate,
+      lower = pmax(0, estimate - qnorm(.975)*sqrt(pmax(variance, 0))),
+      upper = pmin(1, estimate + qnorm(.975)*sqrt(pmax(variance, 0))))
+  }) %>% bind_rows() %>% as.data.frame()
+}
+aj_curve <- ci_extract(ci_grade)
+aj_summary <- ci_extract(ci_grade, c(12,24,36)) %>% arrange(grade, month, cause) %>% as.data.frame()
+aj_overall_summary <- ci_extract(ci_overall, c(12,24,36), grouped = FALSE)
+         
+probability_check <- merge(subset(aj_summary, cause == "distress"),
+  subset(aj_summary, cause == "paid"), by = c("grade", "month"))
+stopifnot(all(probability_check$CIF.x + probability_check$CIF.y <= 1+1e-10))
+         
+aj_summary %>% print(row.names = FALSE)
+save_table(aj_curve, "cr_aj_curves")
+save_table(aj_summary, "cr_aj_summary")
+save_table(aj_overall_summary, "cr_aj_overall_summary")
+
+aj_plot <- aj_curve %>% filter(month <= 36) %>%
+  mutate(cause = factor(cause, levels = names(cause_labels), labels = cause_labels)) %>%
+  ggplot(aes(month, CIF, colour = grade)) + geom_step(linewidth = .9) +
+  facet_wrap(~ cause, nrow = 1) + scale_colour_manual(values = grade_colours) +
+  scale_x_continuous(breaks = seq(0,36,6), limits = c(0,36)) +
+  scale_y_continuous(labels = scales::label_percent(accuracy = 1)) +
+  labs(title = "A. Two competing loan outcomes",
+    subtitle = "cmprsk cumulative incidence estimates by credit grade",
+    x = "Months since origination", y = "Cumulative incidence",
+    caption = "Unadjusted estimates with last-payment proxy times; longer follow-up reflects older cohorts.")
+         
+aj_plot
+save_figure(aj_plot, "cr_01_cif_by_grade", height = 6.5)
+```
+
+```{r}
+#| label: aj-slide-table
+aj_slide_table <- aj_summary %>% select(grade, month, at_risk, cause, CIF) %>%
+  { merge(filter(., cause == "distress") %>% select(-cause) %>% rename(distress_CIF = CIF),
+      filter(., cause == "paid") %>% select(grade, month, paid_CIF = CIF),
+      by = c("grade", "month"), sort = FALSE) } %>%
+  mutate(distress_percent = round(100 * distress_CIF, 2),
+    paid_percent = round(100 * paid_CIF, 2),
+    event_free_percent = round(100 * (1 - distress_CIF - paid_CIF), 2)) %>%
+  select(grade, month, at_risk, distress_percent, paid_percent, event_free_percent) %>%
+  arrange(grade, month) %>% as.data.frame()
+  
+aj_slide_table %>% print(row.names = FALSE)
+save_table(aj_slide_table, "cr_aj_slide_table")
+```
+
+### B. Comparison of 1−KM and Cumulative Incidence
+
+```{r}
+#| label: km-cif-comparison
+km <- survfit(Surv(duration_months, event) ~ grade, data = dat)
+
+km_extract <- function(times = NULL) {
+  s <- if (is.null(times)) summary(km, censored = TRUE) else summary(km, times = times)
+  data.frame(grade = sub("^grade=", "", as.character(s$strata)), month = s$time,
+    net_risk = 1 - s$surv)
+}
+
+km_cif <- aj_summary %>% filter(cause == "distress") %>%
+  left_join(km_extract(c(12, 24, 36)), by = c("grade", "month")) %>%
+  mutate(gap_percentage_points = 100 * (net_risk - CIF)) %>% as.data.frame()
+stopifnot(!anyNA(km_cif$net_risk), all(km_cif$gap_percentage_points >= -1e-8))
+
+km_cif %>% select(grade, month, at_risk, CIF, net_risk, gap_percentage_points) %>% print(row.names = FALSE)
+
+comparison_curve <- bind_rows(
+  aj_curve %>% filter(cause == "distress") %>%
+    transmute(grade, month, probability = CIF, method = "AJ cumulative incidence"),
+  km_extract() %>% transmute(grade, month, probability = net_risk, method = "1 - KM (net risk)"),
+  data.frame(grade = LETTERS[1:7], month = 0, probability = 0, method = "1 - KM (net risk)")) %>%
+  arrange(grade, method, month) %>% as.data.frame()
+
+comparison_plot <- comparison_curve %>% filter(month <= 36) %>%
+  ggplot(aes(month, probability, linetype = method, colour = method)) +
+  geom_step(linewidth = .85) + facet_wrap(~ grade, nrow = 2) +
+  scale_colour_manual(values = c("AJ cumulative incidence" = "#365D78", "1 - KM (net risk)" = "#93A7B5")) +
+  scale_linetype_manual(values = c("AJ cumulative incidence" = 1, "1 - KM (net risk)" = 2)) +
+  scale_x_continuous(breaks = c(0, 12, 24, 36)) +
+  scale_y_continuous(labels = scales::label_percent(accuracy = 1)) +
+  labs(title = "B. Net risk and cumulative incidence differ",
+    subtitle = "Same distress definition and follow-up; different handling of completed repayment",
+    x = "Months since origination", y = "Distress probability / net risk",
+    caption = "AJ incorporates fully paid loans as a competing outcome. Both curves use proxy event times.")
+
+comparison_plot
+save_table(km_cif, "cr_km_vs_cif")
+save_figure(comparison_plot, "cr_02_km_vs_cif", height = 8)
+```
+
+### Gray tests with cmprsk
+
+```{r}
+#| label: gray-tests
+extract_gray <- function(fit, adjustment) {
+  z <- as.data.frame(fit$Tests)
+  data.frame(cause = ifelse(rownames(z) == "1", "distress", "paid"),
+    adjustment = adjustment, chisq = z$stat, df = z$df, p_value = z$pv,
+    p_display = format.pval(z$pv, digits = 3, eps = .001), row.names = NULL)
+}
+
+gray_results <- bind_rows(extract_gray(ci_grade, "Unstratified"),
+  extract_gray(ci_stratified, "Stratified by issue_year")) %>% as.data.frame()
+gray_results %>% print(row.names = FALSE)
+save_table(gray_results, "cr_gray_tests")
+```
